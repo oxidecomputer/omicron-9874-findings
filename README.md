@@ -23,6 +23,7 @@ Either one of these should be sufficient for most use cases. Both of them togeth
 - **[repro-race.sh](repro-race.sh)** — reproduces the `CREATE INDEX IF NOT EXISTS` concurrency bug where OOM during backfill causes the index to silently not be created.
 - **[test-thresholds.sh](test-thresholds.sh)** — empirical validation of OOM thresholds across four schema configurations at default batch size.
 - **[test-batch-size.sh](test-batch-size.sh)** — measures the effect of reducing `bulkio.index_backfill.batch_size` on the baseline schema.
+- **[bench-index-creation.sh](bench-index-creation.sh)** — benchmarks index creation wall-clock time for batch size 50000 vs 5000 across row counts (1M–5M) using hyperfine.
 
 ## Running the scripts
 
