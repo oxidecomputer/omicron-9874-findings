@@ -4,7 +4,7 @@ Test data for the analysis in [index-backfill-oom-analysis.md](index-backfill-oo
 
 ## Threshold vs. schema (batch_size=50,000)
 
-Tested with `--max-sql-memory=128MiB` and default batch size. All four schemas fall into Regime B (the 32M → 64M slab doubling fails due to in-flight batch + fetcher overhead), so the Regime B formula `N_max ≈ (B − R) / (bpe + 16) = 96M / (bpe + 16)` approximates the threshold.
+Tested with `--max-sql-memory=128MiB` and default batch size. All four schemas fall into Regime B (the 32M → 64M slab doubling eventually succeeds, then the post-doubling headroom is insufficient for the batch pipeline). The empirical approximation `N_max ≈ (B − R) / (bpe + 16) = 96M / (bpe + 16)` estimates the row count at which the doubling becomes likely to succeed during a fill/flush cycle.
 
 | Config | bpe (est.) | Predicted N_max | Empirical threshold |
 |---|---|---|---|
@@ -44,10 +44,10 @@ Control (UUID PK, TIMESTAMPTZ idx, bpe ≈ 37):
 
 1. **batch_size matters for bpe ≈ 29.** Despite the compact entry size, bpe = 29 is Regime B (not A) — batch_size reduction from 50K to 5K shifts the threshold upward by ~100K rows.
 
-2. **bs=10K is paradoxically worse than bs=50K for this schema.** At all tested row counts, bs=10K OOMs while bs=50K passes at 1.9M and 2.0M. This is likely a timing effect: smaller batches change the producer/consumer race in a way that increases pipeline depth at the critical moment, but the per-batch cost reduction is not enough to compensate. The effect is non-deterministic.
+2. **bs=10K is paradoxically worse than bs=50K for this schema.** At all tested row counts, bs=10K OOMs while bs=50K passes at 1.9M and 2.0M. This is likely a timing effect: smaller batches change the producer/consumer race in a way that makes the doubling more likely to succeed (lower momentary `k`), but the per-batch cost reduction is not enough to keep the post-doubling headroom safe. The effect is non-deterministic.
 
-3. **bs=5K shows non-monotonic behavior:** OOM at 1.9M, PASS at 2.0M–2.1M, OOM at 2.2M. This further confirms the behavior is timing-sensitive. The steady-state outcome depends on the exact interplay between batch production rate, kvBuf flush duration, and channel fill level at the critical slab doubling.
+3. **bs=5K shows non-monotonic behavior:** OOM at 1.9M, PASS at 2.0M–2.1M, OOM at 2.2M. This further confirms the behavior is timing-sensitive. The outcome depends on whether the doubling succeeds during a low-`k` window, and whether the producer subsequently encounters a high-`k` event in the reduced post-doubling headroom.
 
-4. **The Regime B control works as expected:** bs=10K and bs=5K both fix the OOM for bpe ≈ 37 at 2M rows, consistent with the model.
+4. **The Regime B → C shift works as expected:** bs=10K and bs=5K both fix the OOM for bpe ≈ 37 at 2M rows, consistent with the model — at smaller batch_size, the post-doubling headroom accommodates worst-case pipeline depth.
 
 The practical implication is that **bs=5K is the safest choice** for migration-time index creation, as it provides the most headroom. bs=10K may not help (or may be worse) for compact schemas.

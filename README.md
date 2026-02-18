@@ -18,7 +18,7 @@ Either one of these should be sufficient for most use cases. Both of them togeth
 
 ## Files
 
-- **[index-backfill-oom-analysis.md](index-backfill-oom-analysis.md)** — detailed analysis of the kvBuf slab-doubling mechanism, memory monitor hierarchy, and the three failure regimes.
+- **[index-backfill-oom-analysis.md](index-backfill-oom-analysis.md)** — detailed analysis of the kvBuf slab-doubling mechanism, memory monitor hierarchy, and the three memory regimes.
 - **[empirical-validation.md](empirical-validation.md)** — raw test data validating the OOM model across schema configurations and batch sizes.
 - **[repro-race.sh](repro-race.sh)** — reproduces the `CREATE INDEX IF NOT EXISTS` concurrency bug where OOM during backfill causes the index to silently not be created.
 - **[test-thresholds.sh](test-thresholds.sh)** — empirical validation of OOM thresholds across four schema configurations at default batch size.

@@ -48,7 +48,7 @@ The [`kvBuf`][kvbuf-struct] stores index entries compactly using two parallel ar
 1. **`slab []byte`** — raw key/value bytes packed contiguously ([`bpe`](#bpe) bytes per entry).
 2. **`entries []kvBufEntry`** — [16 bytes per entry][kvbuf-entry] (two `uint64` packing offset and length into the slab).
 
-Both arrays grow by up to doubling per step, clamped to `[minSlabGrow, maxSlabGrow]` and `[minEntryGrow, maxEntryGrow]` respectively, and [further reduced][slab-budget-reduction] if the remaining budget is insufficient for a full doubling. The [growth constants][growth-constants] are:
+Both arrays grow by doubling per step, clamped to `[minSlabGrow, maxSlabGrow]` and `[minEntryGrow, maxEntryGrow]` respectively. The [growth constants][growth-constants] are:
 
 ```go
 const minSlabGrow = 512 << 10   // 512 KiB
@@ -58,6 +58,8 @@ const maxEntryGrow = (4 << 20) >> entrySizeShift  // 256K items = 4 MiB
 ```
 
 A [balancing loop][balancing-loop] in `fits()` adjusts entries growth proportionally to slab growth, so the two arrays stay roughly in ratio.
+
+The code contains a [reduction loop][slab-budget-reduction] that halves the growth increment when `remaining` (the gap between current usage and `maxBufferLimit`) is tight. However, for index backfills this loop is inert: `maxBufferLimit` is set to `max_buffer_size` (512 MiB), so `remaining` is always enormous relative to the growth request. Growth against the root budget is mediated solely by `acc.Grow()`, which either succeeds (full doubling) or fails (triggering a flush). There are no partial-doubling steps.
 
 Each growth step calls [`acc.Grow(needed)`][grow-call], which charges the root monitor. Crucially, the account is **monotonically non-decreasing**: [`Reset()`][kvbuf-reset] sets `len=0` but preserves `cap`, and the memory account is never shrunk (unless cumulative [underfill exceeds 1 GiB][underfill-check]).
 
@@ -71,12 +73,12 @@ Each growth step calls [`acc.Grow(needed)`][grow-call], which charges the root m
 
 ## Slab doubling and the growth accounting identity
 
-Because each growth step charges the account by exactly the capacity added ([`acc.Grow(needed)`][grow-call] on line 119, then [`make(..., cap+slabGrow)`][slab-realloc] on line 131 and [`make(..., cap+entryGrow)`][entry-realloc] on line 126), there is an identity that holds regardless of individual step sizes:
+Because each growth step charges the account by exactly the capacity added ([`acc.Grow(needed)`][grow-call] on line 119, then [`make(..., cap+slabGrow)`][slab-realloc] on line 131 and [`make(..., cap+entryGrow)`][entry-realloc] on line 126), there is an identity:
 
 > **Cumulative account growth = final array capacity.**
 
-* In the typical case (budget unconstrained), the slab grows through steps 512K → 1M → 2M → 4M → 8M → 16M → 32M → 64M. The cumulative growth charges are 512K + 512K + 1M + 2M + 4M + 8M + 16M + 32M = 64M, which equals the final slab capacity.
-* If the budget is tight at an intermediate step, the [reduction loop][slab-budget-reduction] produces smaller increments (e.g., 8M → 12M → 16M instead of 8M → 16M), but the identity still holds: the slab reaches the same final capacity through more steps with smaller charges. The same holds for the entries array.
+* Growth is a pure doubling sequence: 512K → 1M → 2M → 4M → 8M → 16M → 32M → 64M. The cumulative charges are 512K + 512K + 1M + 2M + 4M + 8M + 16M + 32M = 64M, which equals the final slab capacity. The same holds for the entries array.
+* The identity holds because each step charges `acc.Grow(needed)` by exactly the capacity added (line 119 vs lines 126/131).
 
 [slab-realloc]: https://github.com/oxidecomputer/cockroach/blob/367bca413bc24e6213a45663fccd583cc726ba08/pkg/kv/bulk/kv_buf.go#L131
 [entry-realloc]: https://github.com/oxidecomputer/cockroach/blob/367bca413bc24e6213a45663fccd583cc726ba08/pkg/kv/bulk/kv_buf.go#L126
@@ -92,6 +94,19 @@ total_kvBuf_root_charge = max(R, slab_cap + entries_cap)
 
 [reserve]: https://github.com/oxidecomputer/cockroach/blob/367bca413bc24e6213a45663fccd583cc726ba08/pkg/kv/bulk/buffering_adder.go#L84-L127
 
+## The kvBuf flush cycle
+
+When `fits()` returns false (because `acc.Grow` fails against the root monitor), the `BufferingAdder` handles it gracefully. The [`Add` method][add-flush] calls `doFlush()`, which sorts the accumulated entries, ingests an SSTable, and calls [`curBuf.Reset()`][do-flush-reset]. `Reset()` sets `len=0` but preserves capacity and does **not** shrink the memory account (the only post-flush `Shrink` path requires accumulated [underfill > 1 GiB][underfill-check], which is effectively unreachable here since the buffer is nearly full when it flushes).
+
+After the flush, `fits()` is called again with the empty buffer. Since `len=0` and existing capacity is ample, it succeeds via the [fast path][kvbuf-fits] (lines 54–56): the entry fits within current capacity, so no `Grow` is needed. The entry is appended, and the buffer begins refilling within existing capacity — no new `Grow` calls until capacity is exhausted again.
+
+When the buffer fills up again, `fits()` tries to double again. If the root budget still cannot accommodate the growth, the cycle repeats: flush, refill, flush. The system can process unlimited entries by cycling flush/fill at whatever capacity it reached.
+
+**Key insight**: the kvBuf never causes a fatal error. Growth failure triggers a flush, not an abort. The fatal path is elsewhere — in the producer's `GrowBoundAccount`, which has no such graceful fallback.
+
+[add-flush]: https://github.com/oxidecomputer/cockroach/blob/367bca413bc24e6213a45663fccd583cc726ba08/pkg/kv/bulk/buffering_adder.go#L167-L208
+[do-flush-reset]: https://github.com/oxidecomputer/cockroach/blob/367bca413bc24e6213a45663fccd583cc726ba08/pkg/kv/bulk/buffering_adder.go#L331
+
 ## <a name="bpe"></a>Bytes per entry (bpe)
 
 Each secondary index entry encodes as a key of the form:
@@ -106,19 +121,17 @@ With the entries array overhead of 16 bytes per entry, the effective per-entry c
 
 ## The critical slab doubling step
 
-The slab doubles through a predictable sequence: 512K, 1M, 2M, ..., 32M, 64M. The step from 32M to 64M is the critical one. At that point, the kvBuf account and the growth request both depend on bpe through the entries array, which the [balancing loop][balancing-loop] sizes proportionally to the slab.
+The slab doubles through a predictable sequence: 512K, 1M, 2M, ..., 32M, 64M. The step from 32M to 64M is the critical one because its outcome determines whether the system enters a safe steady state or a danger zone. At that point, the kvBuf account and the growth request both depend on bpe through the entries array, which the [balancing loop][balancing-loop] sizes proportionally to the slab.
 
-At slab capacity `S`, the entries array holds `S / bpe` entries at 16 bytes each, so `entries_cap ≈ 16S / bpe`. At the moment of the critical step (`S = 32M`):
+At slab capacity `S`, the entries array holds `S / bpe` entries at 16 bytes each, so `entries_cap ≈ 16S / bpe`. When the 32 MiB slab fills up, `fits()` tries to double to 64 MiB. The growth request is `~(32 + 512/bpe)` MiB (slab + entries). This succeeds iff the root budget can accommodate the current kvBuf account plus the growth plus in-flight batches plus fetcher overhead.
 
-```
-kvBuf_account = S + 16S/bpe     = 32 + 512/bpe          (MiB)
-growth        = S + 16S/bpe     = 32 + 512/bpe          (MiB)
-peak (after)  = 2 × (32 + 512/bpe) = 64 + 1024/bpe      (MiB)
-```
+**If the growth fails**: the adder flushes, and the slab stays at 32 MiB. The system continues safely — at slab=32M, the remaining budget (~72 MiB for bpe=37) comfortably holds the full batch pipeline. The buffer cycles flush/fill indefinitely at 32 MiB.
 
-For concrete schemas:
+**If the growth succeeds**: the kvBuf account jumps to the post-doubling peak, leaving far less headroom. This is where the danger begins — the producer's subsequent `GrowBoundAccount` calls may fail in this reduced headroom.
 
-| Schema | bpe | entries (16S/bpe) | kvBuf account | Growth request | Peak after doubling |
+Post-doubling state for concrete schemas:
+
+| Schema | bpe | entries (16S/bpe) | Pre-doubling kvBuf | Growth request | Post-doubling kvBuf |
 |---|---|---|---|---|---|
 | INT8 PK, BOOL idx | ~29 | ~17.7 MiB | ~49.7 MiB | ~49.7 MiB | ~99.3 MiB |
 | UUID PK, TIMESTAMPTZ idx | ~37 | ~13.8 MiB | ~45.8 MiB | ~45.8 MiB | ~91.7 MiB |
@@ -140,21 +153,27 @@ for indexBatch := range indexEntryCh {
 
 At any moment, there can be up to `k` batches in flight: one being consumed, plus up to 10 buffered in the channel (and possibly one being built by the producer). Each batch consumes approximately `batch_size × (bpe + E)` bytes, where `E ≈ 56` is `sizeof(rowenc.IndexEntry)` (the [Go struct overhead][sizeof-entry] tracked by `GrowBoundAccount` in [`BuildIndexEntriesChunk`][build-chunk]). All `k` batches are charged to the root monitor simultaneously.
 
-The producer does **not** self-limit gracefully: when `GrowBoundAccount` fails, the error propagates up and **fails the entire schema change job**. There is no retry or backpressure. So `k` at the critical moment determines whether the doubling succeeds.
+The producer does **not** self-limit gracefully: when `GrowBoundAccount` fails, the error propagates up and **fails the entire schema change job**. There is no retry or backpressure. This is the fatal path. By contrast, the kvBuf path is graceful: growth failure triggers a flush, not an abort (see [flush cycle](#the-kvbuf-flush-cycle) above).
 
-The doubling succeeds iff the kvBuf account, the growth request, and all in-flight batches fit within the budget `B`:
+**The OOM occurs when**: the 32M → 64M doubling has already succeeded (kvBuf at `64 + 1024/bpe` MiB), AND the producer's subsequent batch allocation pushes total root usage over `B`. The post-doubling headroom available for batches is:
 
 ```
-(32 + 512/bpe) + (32 + 512/bpe) + k × batch_size × (bpe + E) / 2²⁰ ≤ B
+headroom = B − (64 + 1024/bpe) − F    (MiB)
 ```
 
-Simplifying:
+where `F` is overhead from the row fetcher's scan buffers ([`DefaultBatchBytesLimit`][batch-bytes-limit] = 10 MiB) and other root monitor charges. The producer's `GrowBoundAccount` fails when in-flight batches exceed this headroom:
+
+```
+k × batch_size × (bpe + E) / 2²⁰ > headroom    (MiB)
+```
+
+The doubling itself succeeds when pipeline depth is momentarily low. This requires the kvBuf account, the growth request, and in-flight batches to fit within `B`:
 
 ```
 64 + 1024/bpe + k × batch_size × (bpe + E) / 2²⁰ ≤ B    (MiB)
 ```
 
-Additionally, even if the doubling succeeds, the system can still OOM afterwards: the post-doubling kvBuf account is `64 + 1024/bpe` MiB, and the producer's subsequent `GrowBoundAccount` calls fail if the remaining budget cannot accommodate in-flight batches plus the row fetcher's scan buffers (~10 MiB from [`DefaultBatchBytesLimit`][batch-bytes-limit]).
+The failure is therefore **non-deterministic**: the doubling succeeds during a transient low-`k` window, then the producer hits a transient high-`k` event in the reduced post-doubling headroom.
 
 [batch-bytes-limit]: https://github.com/oxidecomputer/cockroach/blob/367bca413bc24e6213a45663fccd583cc726ba08/pkg/sql/rowinfra/base.go#L41-L43
 
@@ -162,22 +181,24 @@ Additionally, even if the doubling succeeds, the system can still OOM afterwards
 [sizeof-entry]: https://github.com/oxidecomputer/cockroach/blob/367bca413bc24e6213a45663fccd583cc726ba08/pkg/sql/backfill/backfill.go#L784
 [grow-bound-account]: https://github.com/oxidecomputer/cockroach/blob/367bca413bc24e6213a45663fccd583cc726ba08/pkg/sql/backfill/backfill.go#L789
 
-## Three regimes: whether the critical doubling succeeds
+## Three regimes
 
-The doubling condition partitions the (bpe, batch_size, k) space into three regimes.
+The outcome of the 32M → 64M doubling attempt, combined with the post-doubling headroom, partitions the (bpe, batch_size, k) space into three regimes.
 
-### Regime A: entries overhead alone exceeds budget (`bpe < bpe_min`)
+### Regime A (safe): doubling impossible (`bpe < bpe_min`)
 
-Setting `k = 0` (no batches at all) gives a hard floor:
+Setting `k = 0` (no batches at all) gives a hard floor for the doubling to be possible:
 
 ```
 64 + 1024/bpe ≤ B
 bpe ≥ 1024 / (B − 64)
 ```
 
-For `B = 128 MiB`: **`bpe_min = 16`**. When `bpe < 16`, the entries array alone makes the 32M → 64M doubling impossible regardless of batch size or pipeline depth. In practice, the fetcher overhead (`F ≈ 10 MiB`) raises the effective floor to `1024 / 54 ≈ 19`.
+For `B = 128 MiB`: **`bpe_min = 16`**. When `bpe < 16`, the post-doubling kvBuf account alone exceeds the root budget, so the growth request always fails. In practice, the fetcher overhead (`F ≈ 10 MiB`) raises the effective floor to `1024 / 54 ≈ 19`.
 
-This boundary is essentially unreachable with real schemas. Even an `INT8` PK with a `BOOL` index gives bpe ≈ 19–29.
+**This regime is safe, not the worst case.** The growth always fails, the adder flushes gracefully, and the kvBuf cycles flush/fill at 32 MiB indefinitely. At slab=32M, the remaining budget is ample: `128 − (32 + 512/bpe) − F`. Even at bpe=16 (kvBuf=64M), the remaining 54 MiB easily holds the full batch pipeline (k=12 × 3.4M = 41M). The system processes unlimited rows.
+
+This boundary is essentially unreachable with real Omicron schemas (all UUID PKs, bpe ≥ 29).
 
 | Schema | PK contribution | Indexed col | Overhead | bpe (est.) | Regime |
 |---|---|---|---|---|---|
@@ -187,23 +208,23 @@ This boundary is essentially unreachable with real schemas. Even an `INT8` PK wi
 | UUID PK, INT4 idx | ~19 | ~5 | ~8 | ~32 | B |
 | UUID PK, TIMESTAMPTZ idx | ~19 | ~11 | ~7 | ~37 | B |
 
-### Regime B: doubling blocked by batch overhead (`bpe ≥ bpe_min`, too many or too large batches)
+### Regime B (OOM): doubling succeeds, insufficient headroom (`bpe ≥ bpe_min`, default batch_size)
 
-When `bpe ≥ bpe_min` but the in-flight batch memory plus other overhead is too large, the doubling fails. The headroom available is:
+When `bpe ≥ bpe_min`, the 32M → 64M doubling *can* succeed when pipeline depth is momentarily low. The doubling succeeds when `k` is small enough that in-flight batches leave room for the growth request. For `console_session` (bpe ≈ 37), the doubling requires `k ≤ 5`.
+
+Once the doubling succeeds, the kvBuf account consumes most of the budget. The post-doubling headroom available for batches is:
 
 ```
-headroom = B − 64 − 1024/bpe − F    (MiB)
+headroom = B − (64 + 1024/bpe) − F    (MiB)
 ```
 
-Where `F` is overhead from the row fetcher's scan buffers (`DefaultBatchBytesLimit` = 10 MiB) and other root monitor charges. The doubling succeeds iff `k × batch_size × (bpe + E) / 2²⁰ ≤ headroom`.
+For `console_session` (bpe ≈ 37, headroom ≈ 26 MiB), each batch costs `50,000 × 93 / 2²⁰ ≈ 4.4 MiB` at the default batch size. The producer's `GrowBoundAccount` fails when `k ≥ 6` (6 × 4.4 = 26.4 MiB ≈ headroom).
 
-For `console_session` (`bpe ≈ 37`, headroom ≈ 26 MiB):
-- Each batch costs `50,000 × 93 / 2²⁰ ≈ 4.4 MiB` at the default batch size. At `k = 6`, the batch pipeline alone uses 26.4 MiB ≈ headroom, so `k ≥ 6` blocks the doubling.
-- At `batch_size = 5,000`, each batch costs ~0.44 MiB. Even `k = 11` (full channel) uses only 4.8 MiB — well within headroom.
+The failure is **non-deterministic**: the doubling succeeds during a transient low-`k` window, then the producer hits a transient high-`k` event. More rows means more fill/flush cycles at 32 MiB before the doubling, which increases the probability that one cycle coincides with low `k`. Once the doubling succeeds, the system remains in the post-doubling danger zone permanently (the account never shrinks), and a high-`k` event eventually triggers the fatal `GrowBoundAccount` failure.
 
-Headroom versus regime at default `batch_size = 50,000`:
+Post-doubling headroom versus regime at default `batch_size = 50,000`:
 
-| bpe | Headroom (B−64−1024/bpe−F) | Per-batch cost | Regime (k=3) | Regime (k=7) | Regime B max rows |
+| bpe | Post-doubling headroom | Per-batch cost | Regime (k=3) | Regime (k=7) | N_max (approx.) |
 |---|---|---|---|---|---|
 | 16 | −10.0 MiB | 3.4 MiB | A | A | — |
 | 29 | 18.7 MiB | 4.1 MiB | C (12.2 < 18.7) | B (28.5 > 18.7) | ~2.13M |
@@ -211,17 +232,19 @@ Headroom versus regime at default `batch_size = 50,000`:
 | 50 | 33.5 MiB | 5.1 MiB | C (15.2 < 33.5) | B (35.5 > 33.5) | ~1.45M |
 | 64 | 38.0 MiB | 5.7 MiB | C (17.2 < 38.0) | B (40.1 > 38.0) | ~1.20M |
 
-Smaller bpe means more entries per slab, which inflates the entries array overhead and leaves less headroom — but also reduces per-batch cost. The exact pipeline depth at the critical moment varies with timing, making the B/C boundary non-deterministic.
+Smaller bpe means more entries per slab, which inflates the entries array overhead and leaves less post-doubling headroom — but also reduces per-batch cost. The exact pipeline depth at the critical moment varies with timing, making the B/C boundary non-deterministic.
 
-All tested schemas (bpe 29–64) exhibited Regime B behavior at the default `batch_size = 50,000`. See [empirical-validation.md](empirical-validation.md) for raw test data.
+The `N_max` column gives the approximate row count at which the doubling becomes likely to succeed during at least one fill/flush cycle. The formula `N_max ≈ (B − R) / (bpe + 16)` (where `R` = 32 MiB reserve) is a useful empirical approximation: it estimates the number of entries that fills the 32 MiB slab, multiplied by the number of flush cycles before the doubling is likely to succeed. The exact threshold is timing-dependent. See [empirical-validation.md](empirical-validation.md) for raw test data.
 
-### Regime C: doubling succeeds (`bpe ≥ bpe_min`, small enough `k × batch_size`)
+All tested schemas (bpe 29–64) exhibited Regime B behavior at the default `batch_size = 50,000`.
 
-When in-flight batch memory fits within the headroom, the 32M → 64M slab doubling succeeds. The kvBuf reaches 64 MiB slab capacity and the pipeline operates indefinitely.
+### Regime C (safe): doubling succeeds, sufficient headroom (`bpe ≥ bpe_min`, small batch_size)
 
-Even after a successful doubling, the post-doubling kvBuf account consumes most of the budget (e.g., ~99 MiB for bpe ≈ 29), leaving limited headroom. If the producer queues enough batches during a kvBuf flush, the combined usage can still exceed the budget.
+Same doubling mechanics as Regime B: the 32M → 64M doubling eventually succeeds during a low-`k` window, and the kvBuf account jumps to `64 + 1024/bpe` MiB. The difference is that `batch_size` is small enough that even worst-case pipeline depth fits in the post-doubling headroom.
 
-Reducing `batch_size` from 50,000 to 5,000 reliably shifts schemas from Regime B to C: for `console_session` at `batch_size = 5,000`, even `k = 11` fits in the headroom.
+At `batch_size = 5,000`: each batch costs `5,000 × 93 / 2²⁰ ≈ 0.44 MiB`. Even `k = 12` (full pipeline) uses only 5.3 MiB — well within the ~26 MiB headroom for bpe=37. The producer's `GrowBoundAccount` always succeeds, and the system processes unlimited rows.
+
+Reducing `batch_size` from 50,000 to 5,000 reliably shifts schemas from Regime B to C. Increasing `B` to 256 MiB achieves the same effect by widening the post-doubling headroom.
 
 ## Tunables analysis
 
@@ -246,7 +269,7 @@ The kvBuf's [own growth limit][kvbuf-max]. The root monitor rejects growth via `
 
 ### `bulkio.index_backfill.batch_size` (default 50,000)
 
-Reducing from 50,000 to 5,000 cuts per-batch cost by 10×, leaving ample headroom for the slab doubling at full pipeline depth.
+Reducing from 50,000 to 5,000 cuts per-batch cost by 10×, so the post-doubling headroom accommodates worst-case pipeline depth.
 
 **Verdict:** effective for all practical schemas (bpe > 16). Use **bs=5,000** (bs=10,000 can be paradoxically worse for compact schemas).
 
