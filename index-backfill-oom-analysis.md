@@ -117,7 +117,9 @@ Each secondary index entry encodes as a key of the form:
 /TableID/IndexID/IndexedCol₁/.../IndexedColₙ/PKCol₁/.../PKColₘ
 ```
 
-The encoded size (`bpe`) depends on the schema. For the `console_session` table (UUID primary key, `TIMESTAMPTZ` index on `time_created`), empirical measurement gives `bpe ≈ 37` bytes.
+The encoded size (`bpe`) depends on the schema. The key components are the table/index prefix (~8 bytes), the encoded indexed columns, and the PK suffix. For the `console_session` table (UUID primary key, `TIMESTAMPTZ` index on `time_created`), empirical measurement gives `bpe ≈ 37` bytes: ~8 bytes prefix + ~11 bytes `TIMESTAMPTZ` + ~19 bytes UUID.
+
+Since virtually every Omicron table uses UUID primary keys (~19 bytes), the PK suffix alone accounts for over half of bpe. Even the smallest possible indexed column (BOOL, ~2 bytes) yields `bpe ≥ 29` (prefix + column + UUID ≈ 8 + 2 + 19).
 
 With the entries array overhead of 16 bytes per entry, the effective per-entry cost to the memory budget is `bpe + 16` bytes.
 
@@ -125,7 +127,13 @@ With the entries array overhead of 16 bytes per entry, the effective per-entry c
 
 The slab doubles through a predictable sequence: 512K, 1M, 2M, ..., 32M, 64M. The step from 32M to 64M is the critical one because its outcome determines whether the system enters a safe steady state or a danger zone. At that point, the kvBuf account and the growth request both depend on bpe through the entries array, which the [balancing loop][balancing-loop] sizes proportionally to the slab.
 
-At slab capacity `S`, the entries array holds `S / bpe` entries at 16 bytes each, so `entries_cap ≈ 16S / bpe`. When the 32 MiB slab fills up, `fits()` tries to double to 64 MiB. The growth request is `~(32 + 512/bpe)` MiB (slab + entries). This succeeds iff the root budget can accommodate the current kvBuf account plus the growth plus in-flight batches plus fetcher overhead.
+At slab capacity `S`, the entries array holds `S / bpe` entries at 16 bytes each, so `entries_cap ≈ 16S / bpe`. Combined with the [growth accounting identity](#slab-doubling-and-the-growth-accounting-identity), the total kvBuf charge at slab capacity `S` is:
+
+```
+kvBuf_peak(S) = S + 16S / bpe = S × (1 + 16/bpe)
+```
+
+When the 32 MiB slab fills up, `fits()` tries to double to 64 MiB. The growth request is `~(32 + 512/bpe)` MiB (slab + entries). This succeeds iff the root budget can accommodate the current kvBuf account plus the growth plus in-flight batches plus fetcher overhead.
 
 **If the growth fails**: the adder flushes, and the slab stays at 32 MiB. The system continues safely — at slab=32M, the remaining budget (~72 MiB for bpe=37) comfortably holds the full batch pipeline. The buffer cycles flush/fill indefinitely at 32 MiB.
 
@@ -156,7 +164,13 @@ for indexBatch := range indexEntryCh {
 }
 ```
 
-At any moment, there can be up to `k` batches in flight: one being consumed, plus up to 10 buffered in the channel (and possibly one being built by the producer). Each batch consumes approximately `batch_size × (bpe + E)` bytes, where `E ≈ 56` is `sizeof(rowenc.IndexEntry)` (the [Go struct overhead][sizeof-entry] tracked by `GrowBoundAccount` in [`BuildIndexEntriesChunk`][build-chunk]). All `k` batches are charged to the root monitor simultaneously.
+At any moment, there can be up to `k` batches in flight. The maximum value of `k` is 12:
+
+* 1 being built by the producer
+* 10 buffered in the channel
+* 1 being consumed.
+
+Each batch consumes approximately `batch_size × (bpe + E)` bytes, where `E ≈ 56` is `sizeof(rowenc.IndexEntry)` (the [Go struct overhead][sizeof-entry] tracked by `GrowBoundAccount` in [`BuildIndexEntriesChunk`][build-chunk]). All `k` batches are charged to the root monitor.
 
 While the channel size applies backpressure on the producer, memory use does not: when `GrowBoundAccount` fails, the error propagates up and fails the entire schema change job! There is no retry or flush mechanism within the producer. This is the fatal path. By contrast, as mentioned above, the consumer is graceful about this.
 
@@ -195,7 +209,7 @@ The failure is therefore non-deterministic: the doubling succeeds during a trans
 
 The outcome of the 32M → 64M doubling attempt, combined with the post-doubling headroom, partitions the (bpe, batch_size, k) space into three regimes.
 
-### Regime A (safe): doubling impossible (`bpe < bpe_min`)
+### Regime A (safe): doubling impossible
 
 Setting `k = 0` (no batches at all) gives a hard floor for the doubling to be possible:
 
@@ -204,7 +218,7 @@ Setting `k = 0` (no batches at all) gives a hard floor for the doubling to be po
 bpe ≥ 1024 / (B − 64)
 ```
 
-For `B = 128 MiB`: **`bpe_min = 16`**. When `bpe < 16`, the post-doubling kvBuf account alone exceeds the root budget, so the growth request always fails. In practice, the fetcher overhead (`F ≈ 10 MiB`) raises the effective floor to `1024 / 54 ≈ 19`.
+For `B = 128 MiB`, `bpe_min = 16`. When `bpe < 16`, the post-doubling kvBuf account alone exceeds the root budget, so the growth request always fails. In practice, the fetcher overhead (`F ≈ 10 MiB`) raises the effective floor to `1024 / 54 ≈ 19`.
 
 This means that growth always fails, the adder flushes gracefully, and the kvBuf cycles flush/fill at 32 MiB indefinitely. At slab=32M, the remaining budget is ample: `128 − (32 + 512/bpe) − F`. Even at bpe=16 (kvBuf=64M), the remaining 54 MiB easily holds the full batch pipeline (k=12 × 3.4M = 41M). The system processes unlimited rows.
 
@@ -218,7 +232,7 @@ This boundary is essentially unreachable with real Omicron schemas (all UUID PKs
 | UUID PK, INT4 idx | ~19 | ~5 | ~8 | ~32 | B |
 | UUID PK, TIMESTAMPTZ idx | ~19 | ~11 | ~7 | ~37 | B |
 
-### Regime B (OOM): doubling succeeds, insufficient headroom (`bpe ≥ bpe_min`, default batch_size)
+### Regime B (OOM): doubling succeeds, insufficient headroom
 
 When `bpe ≥ bpe_min`, the 32M → 64M doubling can succeed when pipeline depth is momentarily low. The doubling succeeds when `k` is small enough that in-flight batches leave room for the growth request. For `console_session` (bpe ≈ 37), the doubling requires `k ≤ 5`.
 
@@ -230,9 +244,9 @@ headroom = B − (64 + 1024/bpe) − F    (MiB)
 
 For `console_session` (bpe ≈ 37, headroom ≈ 26 MiB), each batch costs `50,000 × 93 bytes ≈ 4.4 MiB` at the default batch size. The producer's `GrowBoundAccount` fails when `k ≥ 6` (6 × 4.4 = 26.4 MiB ≈ headroom).
 
-The failure is non-deterministic: the doubling succeeds during a transient low-`k` window, then the producer hits a transient high-`k` event. More rows means more fill/flush cycles at 32 MiB before the doubling, which increases the probability that one cycle coincides with low `k` (this is why the failure appears to be deterministic in practice). Once the doubling succeeds, the system remains in the post-doubling danger zone permanently (the account never shrinks), and a high-`k` event eventually triggers the fatal `GrowBoundAccount` failure.
+The failure is non-deterministic: the doubling succeeds during a transient low-`k` window, then the producer hits a transient high-`k` event. More rows means more fill/flush cycles at 32 MiB before the doubling, which increases the probability that one cycle coincides with low `k` (this is why the failure appears to be deterministic in practice). Once the doubling succeeds, the system remains in the post-doubling danger zone permanently, and a high-`k` event eventually triggers the fatal `GrowBoundAccount` failure.
 
-Post-doubling headroom versus regime at default `batch_size = 50,000`:
+At the default batch size, 50,000:
 
 | bpe | Post-doubling headroom | Per-batch cost | Regime (k=3) | Regime (k=7) | N_max (approx.) |
 |---|---|---|---|---|---|
@@ -241,8 +255,13 @@ Post-doubling headroom versus regime at default `batch_size = 50,000`:
 | 37 | 26.3 MiB | 4.4 MiB | C (13.3 < 26.3) | B (31.0 > 26.3) | ~1.81M |
 | 50 | 33.5 MiB | 5.1 MiB | C (15.2 < 33.5) | B (35.5 > 33.5) | ~1.45M |
 | 64 | 38.0 MiB | 5.7 MiB | C (17.2 < 38.0) | B (40.1 > 38.0) | ~1.20M |
+| 100 | 43.8 MiB | 7.4 MiB | C (22.3 < 43.8) | B (52.1 > 43.8) | ~0.83M |
+| 150 | 47.2 MiB | 9.8 MiB | C (29.5 < 47.2) | B (68.8 > 47.2) | ~0.58M |
 
-Note that a smaller bpe means more entries per slab, which inflates the entries array overhead and leaves less post-doubling headroom, but also reduces per-batch cost. The exact pipeline depth at the critical moment varies with timing, making the B/C boundary non-deterministic.
+Note that the effect of bpe on OOM risk is non-monotonic.
+
+* A smaller bpe inflates the entries array overhead and leaves less post-doubling headroom, but also reduces per-batch cost.
+* Conversely, a larger bpe increases headroom, but the per-batch cost grows faster (`batch_size × (bpe + E)`), so the critical pipeline depth decreases. At bpe=150, only k=5 is needed to OOM versus k=6 at bpe=37.
 
 The `N_max` column gives the approximate row count at which the doubling becomes likely to succeed during at least one fill/flush cycle. The formula `N_max ≈ (B − R) / (bpe + 16)` (where `R` = 32 MiB reserve) is a useful empirical approximation: it estimates the number of entries that fills the 32 MiB slab, multiplied by the number of flush cycles before the doubling is likely to succeed. The exact threshold is timing-dependent. See [empirical-validation.md](empirical-validation.md) for raw test data.
 
@@ -340,18 +359,19 @@ Do both:
 1. Set `bulkio.index_backfill.batch_size = 5000`.
 2. Increase `--max-sql-memory` to 256 MiB.
 
-Reducing the batch size is the primary fix: it is sufficient alone for all practical Omicron schemas (bpe ≥ 29) at any memory budget ≥ 128 MiB. Increasing `--max-sql-memory` alone is **not sufficient** for large tables — it shifts the OOM threshold higher but enables a second slab doubling that recreates the same danger at a larger scale. Together, both fixes provide ample headroom.
+Reducing the batch size is the primary fix: it is sufficient alone for all practical Omicron schemas at any memory budget ≥ 128 MiB. Increasing `--max-sql-memory` alone is not sufficient for tables with many rows — it shifts the OOM threshold higher but enables a second slab doubling that recreates the same danger at a larger scale. But together, both fixes provide ample headroom.
 
 ### Why `batch_size = 5000` is sufficient alone
 
-At `B = 128 MiB`, the breakeven is at `bpe ≈ 26`; virtually every Omicron table uses UUID primary keys (`bpe ≥ 29`). The first critical doubling (32M → 64M) still occurs, but the batch pipeline is 10× smaller, so post-doubling headroom easily accommodates worst-case `k`:
+At `B = 128 MiB`, the breakeven is at `bpe ≈ 26`. All practical Omicron schemas have `bpe ≥ 29` (see [bytes per entry](#bpe)). The first critical doubling (32M → 64M) still occurs, but the batch pipeline is 10× smaller, so post-doubling headroom easily accommodates worst-case `k`:
 
-| bpe | kvBuf peak (slab=64M) | Batches (k=12, bs=5000) | F | Total | Headroom @128 MiB |
+| bpe | kvBuf peak (slab=64M) | Batches (k=12, bs=5000) | F | Total | Headroom |
 |---|---|---|---|---|---|
 | 19 | 117.9 MiB | 4.3 MiB | 10 MiB | 132.2 MiB | −4.2 MiB |
 | 26 | 103.4 MiB | 4.7 MiB | 10 MiB | 118.1 MiB | 9.9 MiB |
 | 29 | 99.3 MiB | 4.9 MiB | 10 MiB | 114.2 MiB | 13.8 MiB |
 | 37 | 91.7 MiB | 5.3 MiB | 10 MiB | 107.0 MiB | 21.0 MiB |
+| 100 | 74.2 MiB | 8.9 MiB | 10 MiB | 93.1 MiB | 34.9 MiB |
 
 At `B = 128 MiB`, the second doubling (64M → 128M) cannot succeed: the post-doubling kvBuf alone (~183 MiB for bpe=37) exceeds the budget. The slab stays at 64M and the system cycles flush/fill safely.
 
@@ -365,8 +385,12 @@ Index creation time scales linearly with row count, and batch size plays only  a
 
 At 256 MiB with `batch_size = 5000`, even after the second doubling (slab=128M), the batch pipeline is only ~5.3 MiB instead of ~53 MiB:
 
-| bpe | kvBuf peak (slab=128M) | Batches (k=12, bs=5k) | F | Total | Headroom @256 MiB |
+| bpe | kvBuf peak (slab=128M) | Batches (k=12, bs=5000) | F | Total | Headroom |
 |---|---|---|---|---|---|
-| 29 | 198.6 MiB | 4.9 MiB | 10 MiB | 213.5 MiB | **42.5 MiB** |
-| 37 | 183.4 MiB | 5.3 MiB | 10 MiB | 198.7 MiB | **57.3 MiB** |
-| 100 | 148.5 MiB | 8.9 MiB | 10 MiB | 167.4 MiB | **88.6 MiB** |
+| 19 | 235.8 MiB | 4.3 MiB | 10 MiB | 250.1 MiB | 5.9 MiB |
+| 26 | 206.8 MiB | 4.7 MiB | 10 MiB | 221.5 MiB | 34.5 MiB |
+| 29 | 198.6 MiB | 4.9 MiB | 10 MiB | 213.5 MiB | 42.5 MiB |
+| 37 | 183.4 MiB | 5.3 MiB | 10 MiB | 198.7 MiB | 57.3 MiB |
+| 100 | 148.5 MiB | 8.9 MiB | 10 MiB | 167.4 MiB | 88.6 MiB |
+
+For all practical Omicron schemas (`bpe ≥ 29`), headroom is 42+ MiB. The `bpe = 19` case remains tight, but no Omicron table has a schema that compact.
