@@ -139,6 +139,9 @@ Post-doubling state for concrete schemas:
 | UUID PK, TIMESTAMPTZ idx | ~37 | ~13.8 MiB | ~45.8 MiB | ~45.8 MiB | ~91.7 MiB |
 | STRING(40) PK, TIMESTAMPTZ idx | ~64 | ~8.0 MiB | ~40.0 MiB | ~40.0 MiB | ~80.0 MiB |
 
+> [!IMPORTANT]
+> The table above describes the 32M → 64M step, which is the critical doubling at `B = 128 MiB`. At higher budgets, the slab continues growing in increments of `maxSlabGrow`: 64M → 128M, then 128M → 192M, etc. Each successful step consumes more budget and reduces headroom. At `B = 256 MiB`, the 64M → 128M step succeeds easily for typical schemas, pushing the kvBuf account to ~183 MiB for bpe=37. This second critical doubling reproduces the same OOM mechanism at a higher row count. See [`--max-sql-memory`](#--max-sql-memory-default-128-mib-on-illumos) for the full analysis.
+
 ## About the producer-consumer channel
 
 The producer and consumer run as concurrent goroutines communicating over a [channel of capacity 10][channel-cap]. The producer calls [`GrowBoundAccount`][grow-bound-account] to charge batch memory before sending, and the consumer calls [`ShrinkBoundAccount`][shrink-call] to release it after processing all entries in the batch:
@@ -287,11 +290,11 @@ SET CLUSTER SETTING bulkio.index_backfill.batch_size = 5000;
 The root monitor budget. This is a process startup flag, not a cluster setting.
 
 > [!NOTE]
-> On Linux, `--max-sql-memory` defaults to 25% of system memory. The path to measure memory is stubbed out on illumos, and CockroachDB falls back to a 128 MiB default.
+> On Linux, `--max-sql-memory` defaults to 25% of system memory. The path to determine system memory is stubbed out on illumos, so CockroachDB falls back to a 128 MiB default.
 
-Peak memory at the critical doubling is U-shaped in bpe: compact entries inflate the entries array, while wide entries inflate the batch pipeline. At default `batch_size = 50,000` and worst-case `k = 12`:
+Peak memory at the first critical doubling (32M → 64M) is U-shaped in bpe: compact entries inflate the entries array, while wide entries inflate the batch pipeline. At default `batch_size = 50,000` and worst-case `k = 12`:
 
-| bpe | kvBuf peak | Batch pipeline (k=12) | F | Total |
+| bpe | kvBuf peak (slab=64M) | Batch pipeline (k=12) | F | Total |
 |---|---|---|---|---|
 | 19 (most compact real schema) | 117.9 MiB | 42.9 MiB | 10 MiB | **170.8 MiB** |
 | 37 (console_session) | 91.7 MiB | 53.2 MiB | 10 MiB | **154.9 MiB** |
@@ -299,9 +302,27 @@ Peak memory at the critical doubling is U-shaped in bpe: compact entries inflate
 | 100 (wide compound index) | 74.2 MiB | 89.3 MiB | 10 MiB | **173.5 MiB** |
 | 150 (very wide) | 70.8 MiB | 117.9 MiB | 10 MiB | **198.7 MiB** |
 
-256 MiB covers all realistic schemas with 55+ MiB of headroom. The trade-off: `--max-sql-memory` governs all SQL memory, so doubling it means CockroachDB can consume 128 MiB more under peak SQL workload.
+At first glance, 256 MiB appears to be sufficient. However, this table only accounts for the first doubling. At `B = 256`, the slab has room to double again: **64M → 128M**. The growth request for this step is ~92 MiB (64M slab + ~28M entries for bpe=37), and the pre-doubling kvBuf is ~92 MiB. For the step to succeed, the total must fit in the budget:
 
-**Verdict:** effective for all regimes. **256 MiB** is the recommended value.
+```
+91.7 + 91.7 + k × 4.4 + F ≤ 256    →    k ≤ 14
+```
+
+This succeeds easily even at worst-case `k = 12`. After the second doubling, peak memory is substantially higher:
+
+| bpe | kvBuf peak (slab=128M) | Batch pipeline (k=12) | F | Total | Headroom @256 MiB |
+|---|---|---|---|---|---|
+| 37 (console_session) | 183.4 MiB | 53.2 MiB | 10 MiB | **246.6 MiB** | **9.4 MiB** |
+| 42 | 176.8 MiB | 56.0 MiB | 10 MiB | **242.8 MiB** | **13.2 MiB** |
+| 100 (wide compound index) | 148.5 MiB | 89.3 MiB | 10 MiB | **247.8 MiB** | **8.2 MiB** |
+
+Headroom of <15 MiB is not survivable in practice: fetcher overhead beyond the 10 MiB estimate, concurrent system queries, and monitor bookkeeping easily consume it. **Empirically confirmed:** `CREATE INDEX` with `bs=50000` on a 5M-row baseline table OOMs at `B = 256 MiB` (see `bench-index-creation.sh`), though it succeeds at 3M rows (fewer flush/fill cycles at slab=64M means the second doubling is less likely to trigger).
+
+This is the same non-deterministic mechanism as the first doubling: more rows → more flush/fill cycles at slab=64M → higher probability the second doubling succeeds during a low-`k` window → post-second-doubling headroom is too tight for worst-case pipeline depth.
+
+The slab cannot continue to 192M at `B = 256` (the growth request of ~92 MiB plus the pre-doubling kvBuf of ~183 MiB exceeds 256 MiB at `k = 0`), so the 128M state is the final danger zone.
+
+**Verdict:** `--max-sql-memory = 256 MiB` alone is **not sufficient** for large tables at the default batch size. It shifts the OOM threshold from ~1.85M rows to somewhere between 3M and 5M rows, but does not eliminate it. Must be combined with `batch_size = 5000`.
 
 ### Summary of tunables
 
@@ -310,30 +331,42 @@ Peak memory at the critical doubling is U-shaped in bpe: compact entries inflate
 | `buffer_size` | cluster | no effect |
 | `max_buffer_size` | cluster | no effect |
 | `batch_size` | cluster | **fixes** (use 5,000; avoid 10,000 for compact schemas) |
-| `--max-sql-memory` | startup | **fixes** (use 256 MiB) |
+| `--max-sql-memory` | startup | **insufficient alone** (raises threshold but enables second doubling; use 256 MiB with `batch_size = 5000`) |
 
 ## Recommended mitigation
 
 Do both:
 
-1. Increase `--max-sql-memory` to 256 MiB.
-2. Set `bulkio.index_backfill.batch_size = 5000`.
+1. Set `bulkio.index_backfill.batch_size = 5000`.
+2. Increase `--max-sql-memory` to 256 MiB.
 
-Either fix alone is sufficient for most practical schemas. Together they make the OOM failure essentially unreachable.
+Reducing the batch size is the primary fix: it is sufficient alone for all practical Omicron schemas (bpe ≥ 29) at any memory budget ≥ 128 MiB. Increasing `--max-sql-memory` alone is **not sufficient** for large tables — it shifts the OOM threshold higher but enables a second slab doubling that recreates the same danger at a larger scale. Together, both fixes provide ample headroom.
 
-### Why either alone is sufficient
+### Why `batch_size = 5000` is sufficient alone
 
-**`batch_size = 5000` at 128 MiB.** The breakeven is at `bpe ≈ 26`; virtually every Omicron table uses UUID primary keys (`bpe ≥ 29`).
+At `B = 128 MiB`, the breakeven is at `bpe ≈ 26`; virtually every Omicron table uses UUID primary keys (`bpe ≥ 29`). The first critical doubling (32M → 64M) still occurs, but the batch pipeline is 10× smaller, so post-doubling headroom easily accommodates worst-case `k`:
 
-| bpe | kvBuf peak | Batches (k=12, bs=5000) | F | Total | Headroom @128 MiB |
+| bpe | kvBuf peak (slab=64M) | Batches (k=12, bs=5000) | F | Total | Headroom @128 MiB |
 |---|---|---|---|---|---|
-| 19 | 117.9 MiB | 4.3 MiB | 10 MiB | 132.2 MiB | **−4.2 MiB** |
+| 19 | 117.9 MiB | 4.3 MiB | 10 MiB | 132.2 MiB | −4.2 MiB |
 | 26 | 103.4 MiB | 4.7 MiB | 10 MiB | 118.1 MiB | 9.9 MiB |
 | 29 | 99.3 MiB | 4.9 MiB | 10 MiB | 114.2 MiB | 13.8 MiB |
 | 37 | 91.7 MiB | 5.3 MiB | 10 MiB | 107.0 MiB | 21.0 MiB |
 
-**256 MiB without batch_size change.** The worst-case peak at default `batch_size = 50,000` is ~200 MiB, leaving 56+ MiB of headroom.
+At `B = 128 MiB`, the second doubling (64M → 128M) cannot succeed: the post-doubling kvBuf alone (~183 MiB for bpe=37) exceeds the budget. The slab stays at 64M and the system cycles flush/fill safely.
+
+### Why `--max-sql-memory = 256 MiB` alone is insufficient
+
+As detailed in the [`--max-sql-memory` tunables analysis](#--max-sql-memory-default-128-mib-on-illumos), raising the budget to 256 MiB enables the 64M → 128M slab doubling. After this second doubling, the kvBuf account is ~183 MiB, leaving <15 MiB of headroom for the default batch pipeline — not enough in practice. Empirical testing in `bench-index-creation.rs` confirms an OOM at 5M rows with the default batch size at `B = 256`.
+
+Index creation time scales linearly with row count, and batch size plays only  a minor role; `bs=5000` adds ~3–4% overhead versus `bs=50000` for tables where both succeed (see `bench-index-creation.sh`).
 
 ### Why both together
 
-At 256 MiB + `batch_size = 5000`, even `bpe = 19` passes with 124 MiB to spare. The `batch_size` reduction is strictly redundant at this budget but costs nothing and provides insurance against concurrent SQL workload.
+At 256 MiB with `batch_size = 5000`, even after the second doubling (slab=128M), the batch pipeline is only ~5.3 MiB instead of ~53 MiB:
+
+| bpe | kvBuf peak (slab=128M) | Batches (k=12, bs=5k) | F | Total | Headroom @256 MiB |
+|---|---|---|---|---|---|
+| 29 | 198.6 MiB | 4.9 MiB | 10 MiB | 213.5 MiB | **42.5 MiB** |
+| 37 | 183.4 MiB | 5.3 MiB | 10 MiB | 198.7 MiB | **57.3 MiB** |
+| 100 | 148.5 MiB | 8.9 MiB | 10 MiB | 167.4 MiB | **88.6 MiB** |

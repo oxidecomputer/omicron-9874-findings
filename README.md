@@ -11,10 +11,10 @@ Note that this is currently a **draft**. I (Rain) still need to verify a number 
 
 Do both:
 
-* Run CockroachDB nodes with `--max-sql-memory=256MiB`.
 * Run `SET CLUSTER SETTING bulkio.index_backfill.batch_size = 5000;`.
+* Run CockroachDB nodes with `--max-sql-memory=256MiB`.
 
-Either one of these should be sufficient for most use cases. Both of them together all but eliminate this issue with a substantial cushion.
+Reducing the batch size is the primary fix; it is sufficient alone for all practical Omicron schemas. Increasing `--max-sql-memory` alone is **not sufficient** for large tables: it enables a second slab doubling (64M → 128M) that recreates the OOM at higher row counts. Together, both fixes provide ample headroom.
 
 ## Files
 
