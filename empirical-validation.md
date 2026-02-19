@@ -29,7 +29,7 @@ Reducing `batch_size` to 5,000 eliminates OOM at all tested row counts, confirmi
 
 Benchmarked with `bench-index-creation.sh` at `--max-sql-memory=256MiB`, 3 runs per configuration. An X indicates a"memory budget exceeded" OOM. The ratio column shows the overhead of `bs=5,000` relative to `bs=50,000` in situations where both succeed.
 
-### baseline (UUID PK, TIMESTAMPTZ idx, bpe ≈ 37)
+baseline (UUID PK, TIMESTAMPTZ idx, bpe ≈ 37):
 
 | Row count | bs=50,000      | bs=5,000       | Ratio |
 |-----------|----------------|----------------|-------|
@@ -38,7 +38,7 @@ Benchmarked with `bench-index-creation.sh` at `--max-sql-memory=256MiB`, 3 runs 
 | 3,000,000 | 5.76 ± 0.10s   | 6.01 ± 0.16s   | 1.04× |
 | 5,000,000 | X              | 9.74 ± 0.03s   | —     |
 
-### wide (UUID PK, (TIMESTAMPTZ, STRING(60)) idx, bpe ≈ 100)
+wide (UUID PK, (TIMESTAMPTZ, STRING(60)) idx, bpe ≈ 100):
 
 | Row count | bs=50,000      | bs=5,000       | Ratio |
 |-----------|----------------|----------------|-------|
@@ -47,7 +47,7 @@ Benchmarked with `bench-index-creation.sh` at `--max-sql-memory=256MiB`, 3 runs 
 | 3,000,000 | X              | 8.02 ± 0.06s   | —     |
 | 5,000,000 | X              | 14.26 ± 0.15s  | —     |
 
-### very_wide (UUID PK, (TIMESTAMPTZ, STRING(110)) idx, bpe ≈ 150)
+very_wide (UUID PK, (TIMESTAMPTZ, STRING(110)) idx, bpe ≈ 150):
 
 | Row count | bs=50,000      | bs=5,000           | Ratio |
 |-----------|----------------|---------------------|-------|
