@@ -27,7 +27,7 @@ Reducing `batch_size` to 5,000 eliminates OOM at all tested row counts, confirmi
 
 ## Index creation performance across bpe
 
-Benchmarked with `bench-index-creation.sh` at `--max-sql-memory=256MiB`, 3 runs per configuration. Times are mean ± σ. **X** indicates OOM ("memory budget exceeded"). The ratio column shows the overhead of `bs=5,000` relative to `bs=50,000` where both succeed.
+Benchmarked with `bench-index-creation.sh` at `--max-sql-memory=256MiB`, 3 runs per configuration. An X indicates a"memory budget exceeded" OOM. The ratio column shows the overhead of `bs=5,000` relative to `bs=50,000` in situations where both succeed.
 
 ### baseline (UUID PK, TIMESTAMPTZ idx, bpe ≈ 37)
 
@@ -38,8 +38,6 @@ Benchmarked with `bench-index-creation.sh` at `--max-sql-memory=256MiB`, 3 runs 
 | 3,000,000 | 5.76 ± 0.10s   | 6.01 ± 0.16s   | 1.04× |
 | 5,000,000 | X              | 9.74 ± 0.03s   | —     |
 
-OOM threshold for `bs=50,000` is between 3M and 5M rows. At 256 MiB, the first critical doubling (32M → 64M) is survivable; the OOM is caused by the second doubling (64M → 128M), which pushes kvBuf to ~183 MiB and leaves <10 MiB of headroom for worst-case pipeline depth (see the [`--max-sql-memory` analysis](index-backfill-oom-analysis.md#--max-sql-memory-default-128-mib-on-illumos)).
-
 ### wide (UUID PK, (TIMESTAMPTZ, STRING(60)) idx, bpe ≈ 100)
 
 | Row count | bs=50,000      | bs=5,000       | Ratio |
@@ -48,8 +46,6 @@ OOM threshold for `bs=50,000` is between 3M and 5M rows. At 256 MiB, the first c
 | 2,000,000 | X              | 5.44 ± 0.23s   | —     |
 | 3,000,000 | X              | 8.02 ± 0.06s   | —     |
 | 5,000,000 | X              | 14.26 ± 0.15s  | —     |
-
-OOM threshold for `bs=50,000` is between 1M and 2M rows. The second doubling (64M → 128M) succeeds easily at this bpe (the growth request fits at any realistic `k`), and the post-doubling headroom is only ~8 MiB — tighter than baseline because wider entries inflate the batch pipeline faster than they shrink the entries array.
 
 ### very_wide (UUID PK, (TIMESTAMPTZ, STRING(110)) idx, bpe ≈ 150)
 
@@ -60,11 +56,9 @@ OOM threshold for `bs=50,000` is between 1M and 2M rows. The second doubling (64
 | 3,000,000 | X              | 9.08 ± 0.07s       | —     |
 | 5,000,000 | X              | 15.66 ± 0.19s       | —     |
 
-OOM threshold for `bs=50,000` is below 1M rows. At bpe ≈ 150, the second doubling succeeds when `k ≤ 10`, and the post-doubling headroom (~104 MiB) is insufficient for worst-case pipeline depth (`k = 12` × 9.8 MiB ≈ 118 MiB). `bs=50,000` fails at every tested row count.
-
 ### Observations
 
-1. **OOM threshold decreases with bpe as predicted.** baseline (bpe ≈ 37) survives to 3M rows, wide (bpe ≈ 100) fails at 2M, very_wide (bpe ≈ 150) fails at 1M. This confirms the analysis: wider entries increase per-batch cost (`batch_size × (bpe + E)`) faster than they reduce kvBuf overhead (`16S/bpe`).
+1. **OOM threshold decreases with bpe.** baseline (bpe ≈ 37) survives to 3M rows, wide (bpe ≈ 100) fails at 2M, very_wide (bpe ≈ 150) fails at 1M. This confirms the analysis: wider entries increase per-batch cost (`batch_size × (bpe + E)`) faster than they reduce kvBuf overhead (`16S/bpe`).
 
 2. **`bs=5,000` eliminates OOM for all tested configurations.** Every `bs=5,000` run succeeded, including very_wide at 3M rows (where `bs=50,000` OOMs in under 1.4s).
 
