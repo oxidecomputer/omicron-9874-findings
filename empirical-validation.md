@@ -29,6 +29,10 @@ Reducing `batch_size` to 5,000 eliminates OOM at all tested row counts, confirmi
 
 Benchmarked with `bench-index-creation.sh` at `--max-sql-memory=256MiB`, 3 runs per configuration. An X indicates a"memory budget exceeded" OOM. The ratio column shows the overhead of `bs=5,000` relative to `bs=50,000` in situations where both succeed.
 
+### On Rain's workstation
+
+(Measured on Linux with an AMD Ryzen 7950X.)
+
 baseline (UUID PK, TIMESTAMPTZ idx, bpe ≈ 37):
 
 | Row count | bs=50,000      | bs=5,000       | Ratio |
@@ -55,6 +59,37 @@ very_wide (UUID PK, (TIMESTAMPTZ, STRING(110)) idx, bpe ≈ 150):
 | 2,000,000 | X              | 6.20 ± 0.02s       | —     |
 | 3,000,000 | X              | 9.08 ± 0.07s       | —     |
 | 5,000,000 | X              | 15.66 ± 0.19s       | —     |
+
+### On atrium
+
+(Measured on helios.)
+
+baseline (UUID PK, TIMESTAMPTZ idx, bpe ≈ 37):
+
+| Row count | bs=50,000      | bs=5,000       | Ratio |
+|-----------|----------------|----------------|-------|
+| 1,000,000 | 3.80 ± 0.02s   | 3.88 ± 0.03s   | 1.02× |
+| 2,000,000 | 7.02 ± 0.04s   | 7.31 ± 0.06s   | 1.04× |
+| 3,000,000 | 9.90 ± 0.09s   | 10.38 ± 0.10s  | 1.05× |
+| 5,000,000 | X              | 16.47 ± 0.10s  | —     |
+
+wide (UUID PK, (TIMESTAMPTZ, STRING(60)) idx, bpe ≈ 100):
+
+| Row count | bs=50,000      | bs=5,000       | Ratio |
+|-----------|----------------|----------------|-------|
+| 1,000,000 | 4.85 ± 0.06s   | 5.21 ± 0.06s   | 1.07× |
+| 2,000,000 | X              | 9.44 ± 0.10s   | —     |
+| 3,000,000 | X              | 13.49 ± 0.08s  | —     |
+| 5,000,000 | X              | 23.29 ± 0.06s  | —     |
+
+very_wide (UUID PK, (TIMESTAMPTZ, STRING(110)) idx, bpe ≈ 150):
+
+| Row count | bs=50,000      | bs=5,000       | Ratio |
+|-----------|----------------|----------------|-------|
+| 1,000,000 | X              | 5.85 ± 0.05s   | —     |
+| 2,000,000 | X              | 10.68 ± 0.11s  | —     |
+| 3,000,000 | X              | 15.26 ± 0.13s  | —     |
+| 5,000,000 | X              | 25.84 ± 0.08s  | —     |
 
 ### Observations
 
