@@ -32,7 +32,7 @@ for indexBatch := range indexEntryCh {
 }
 ```
 
-In this analysis, we describe the number of batches in flight at any moment as `k`: 1 being built by the producer, up to 10 buffered in the channel, and 1 being consumed (so the maximum possible `k` is 12).
+In this analysis, we describe the number of batches in flight at any moment as `k`: 1 being built by the producer, up to 10 buffered in the channel, and 1 being consumed. So the maximum possible `k` is 12. We use this value of 12 as part of our analysis below.
 
 * Each batch consumes approximately `batch_size * (bpe + E)` bytes, where [`bpe`](#bpe) is the encoded entry size and `E ~ 56` is `sizeof(rowenc.IndexEntry)` (the [Go struct overhead][sizeof-entry] tracked by `GrowBoundAccount` in [`BuildIndexEntriesChunk`][build-chunk]).
 * All `k` batches are charged to the root monitor.
@@ -241,6 +241,8 @@ As discussed above, reducing the batch size from 50,000 to 5,000 cuts per-batch 
 ```sql
 SET CLUSTER SETTING bulkio.index_backfill.batch_size = 5000;
 ```
+
+(As the `SET CLUSTER SETTING` suggests, this is a cluster-wide persistent setting, and it applies to all nodes and all future backfills. So it only needs to be set once.)
 
 At `B = 128 MiB`, assuming that the slab's growth to 64M is successful, this results in:
 
