@@ -312,9 +312,7 @@ This succeeds easily even at worst-case `k = 12`. After the second doubling, pea
 | 100 | 148.5 MiB              | 89.3 MiB              | 10 MiB | 247.8 MiB     | 8.2 MiB            |
 | 150 | 141.7 MiB              | 117.9 MiB             | 10 MiB | 269.6 MiB     | −13.6 MiB          |
 
-Headroom of <15 MiB is not survivable in practice. (This is the same issue as with the first doubling under a 128MiB limit: more rows mean more flush/fill cycles, and a higher probability that the second doubling succeeds during a low-`k` window. The post-second-doubling headroom is too tight for worst-case pipeline depth.)
-
-Raising `--max-sql-memory` to 256 MiB alone shifts the OOM threshold from ~1.85M rows to somewhere between 3M and 5M rows, but does not eliminate it. Empirical testing in `bench-index-creation.rs` confirms an OOM at 5M rows with the default batch size at `B = 256`.
+It turns out that headroom of <15 MiB is not survivable in practice. (This is the same issue as with the first doubling under a 128MiB limit: more rows mean more flush/fill cycles, and a higher probability that the second doubling succeeds during a low-`k` window. The post-second-doubling headroom is too tight for worst-case pipeline depth.)
 
 ### Recommendation
 
