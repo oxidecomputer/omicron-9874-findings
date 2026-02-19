@@ -58,7 +58,7 @@ very_wide (UUID PK, (TIMESTAMPTZ, STRING(110)) idx, bpe ≈ 150):
 
 ### Observations
 
-1. **OOM threshold decreases with bpe.** baseline survives to 3M rows, wide fails at 2M, very_wide fails at 1M. This is because wider entries increase per-batch cost (`batch_size × (bpe + E)`) faster than they reduce kvBuf overhead (`16S/bpe`).
+1. **OOM threshold decreases with bpe.** baseline survives to 3M rows, wide fails at 2M, and very_wide fails at 1M. This is because wider entries increase per-batch cost (`batch_size × (bpe + E)`) faster than they reduce kvBuf overhead (`16S/bpe`).
 
 2. **`bs=5,000` eliminates OOM for all tested configurations.** Every `bs=5,000` run succeeded, including very_wide at any of the tested row counts.
 
