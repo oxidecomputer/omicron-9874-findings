@@ -58,8 +58,8 @@ Benchmarked with `bench-index-creation.sh` at `--max-sql-memory=256MiB`, 3 runs 
 
 ### Observations
 
-1. **OOM threshold decreases with bpe.** baseline (bpe ≈ 37) survives to 3M rows, wide (bpe ≈ 100) fails at 2M, very_wide (bpe ≈ 150) fails at 1M. This confirms the analysis: wider entries increase per-batch cost (`batch_size × (bpe + E)`) faster than they reduce kvBuf overhead (`16S/bpe`).
+1. **OOM threshold decreases with bpe.** baseline survives to 3M rows, wide fails at 2M, very_wide fails at 1M. This is because wider entries increase per-batch cost (`batch_size × (bpe + E)`) faster than they reduce kvBuf overhead (`16S/bpe`).
 
-2. **`bs=5,000` eliminates OOM for all tested configurations.** Every `bs=5,000` run succeeded, including very_wide at 3M rows (where `bs=50,000` OOMs in under 1.4s).
+2. **`bs=5,000` eliminates OOM for all tested configurations.** Every `bs=5,000` run succeeded, including very_wide at any of the tested row counts.
 
-3. **Performance overhead of `bs=5,000` is small.** For configurations where both batch sizes succeed: ~4% for baseline, ~7% for wide. Index creation time scales linearly with row count regardless of batch size.
+3. **Performance overhead of `bs=5,000` is small.** For configurations where both batch sizes succeed, the performance difference is marginal (3-7%). Index creation time scales roughly linearly with row count regardless of batch size.
